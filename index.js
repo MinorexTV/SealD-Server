@@ -63,6 +63,12 @@ function quotaExceeded(res) {
   });
 }
 
+// Lightweight root endpoint to display current daily usage
+app.get('/', (req, res) => {
+  resetQuotaIfNeeded();
+  res.type('text/plain').send(String(quotaState.used));
+});
+
 // Proxy for episodes (connectivity check)
 app.get('/api/episodes', async (req, res) => {
   try {
