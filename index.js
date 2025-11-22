@@ -1,5 +1,14 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { v4 as uuidv4 } from 'uuid';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Config via .env
 const PORT = process.env.PORT || 3000;
@@ -7,18 +16,21 @@ const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || '';
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'pokemon-tcg-api.p.rapidapi.com';
 const API_BASE = process.env.API_BASE || `https://${RAPIDAPI_HOST}`;
 const DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 99);
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
+const DATA_FILE = process.env.DATA_FILE || './data/users.json';
 
 // Example path to verify connectivity (replace with your sealed-products endpoint later)
 // For now mirrors your snippet endpoint
 const EPISODES_PATH = process.env.EPISODES_PATH || '/episodes';
 
 const app = express();
+app.use(express.json({ limit: '2mb' }));
 
 // Simple CORS for local file:// or other dev origins
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -37,6 +49,79 @@ function getCache(key) {
 }
 function setCache(key, data, ttlMs = 1000 * 60 * 60) { // 1h default
   cache.set(key, { ts: Date.now(), ttlMs, data });
+}
+
+// --- Simple user store (JSON file) ---
+const dataFilePath = path.resolve(__dirname, DATA_FILE);
+
+async function ensureDataFile() {
+  await fs.mkdir(path.dirname(dataFilePath), { recursive: true });
+  try {
+    await fs.access(dataFilePath);
+  } catch {
+    await fs.writeFile(dataFilePath, JSON.stringify({ users: [] }, null, 2), 'utf8');
+  }
+}
+
+async function loadDb() {
+  await ensureDataFile();
+  try {
+    const txt = await fs.readFile(dataFilePath, 'utf8');
+    return JSON.parse(txt || '{}');
+  } catch {
+    return { users: [] };
+  }
+}
+
+async function saveDb(db) {
+  await ensureDataFile();
+  await fs.writeFile(dataFilePath, JSON.stringify(db, null, 2), 'utf8');
+}
+
+async function findUserByEmail(email) {
+  if (!email) return null;
+  const db = await loadDb();
+  return db.users.find(u => u.email.toLowerCase() === email.toLowerCase()) || null;
+}
+
+async function createUser(email, password) {
+  const db = await loadDb();
+  if (db.users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+    throw new Error('exists');
+  }
+  const id = uuidv4();
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = { id, email: email.toLowerCase(), passwordHash, items: [], settings: {} };
+  db.users.push(user);
+  await saveDb(db);
+  return user;
+}
+
+async function updateUserData(userId, items, settings) {
+  const db = await loadDb();
+  const idx = db.users.findIndex(u => u.id === userId);
+  if (idx === -1) throw new Error('not_found');
+  if (Array.isArray(items)) db.users[idx].items = items;
+  if (settings && typeof settings === 'object') db.users[idx].settings = settings;
+  await saveDb(db);
+  return db.users[idx];
+}
+
+function signToken(user) {
+  return jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+}
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = { id: payload.sub, email: payload.email };
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 }
 
 // Simple UTC daily quota (resets at 00:00 UTC)
@@ -67,6 +152,60 @@ function quotaExceeded(res) {
 app.get('/', (req, res) => {
   resetQuotaIfNeeded();
   res.type('text/plain').send(String(quotaState.used));
+});
+
+// --- Auth routes ---
+app.post('/auth/signup', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password || password.length < 6) {
+    return res.status(400).json({ error: 'Email and password (min 6 chars) required' });
+  }
+  try {
+    const user = await createUser(email, password);
+    const token = signToken(user);
+    res.json({ token, user: { id: user.id, email: user.email, items: user.items, settings: user.settings } });
+  } catch (err) {
+    if (err.message === 'exists') return res.status(409).json({ error: 'User already exists' });
+    return res.status(500).json({ error: 'Signup failed' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  try {
+    const user = await findUserByEmail(email);
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = signToken(user);
+    res.json({ token, user: { id: user.id, email: user.email, items: user.items, settings: user.settings } });
+  } catch {
+    return res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// User data endpoints
+app.get('/api/user/data', authMiddleware, async (req, res) => {
+  try {
+    const db = await loadDb();
+    const user = db.users.find(u => u.id === req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ items: user.items || [], settings: user.settings || {} });
+  } catch {
+    res.status(500).json({ error: 'Failed to load user data' });
+  }
+});
+
+app.post('/api/user/data', authMiddleware, async (req, res) => {
+  const { items, settings } = req.body || {};
+  try {
+    const user = await updateUserData(req.user.id, items, settings);
+    res.json({ items: user.items || [], settings: user.settings || {} });
+  } catch (err) {
+    if (err.message === 'not_found') return res.status(404).json({ error: 'User not found' });
+    res.status(500).json({ error: 'Failed to save user data' });
+  }
 });
 
 // Proxy for episodes (connectivity check)
