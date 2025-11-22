@@ -6,6 +6,7 @@ const PORT = process.env.PORT || 3000;
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || '';
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'pokemon-tcg-api.p.rapidapi.com';
 const API_BASE = process.env.API_BASE || `https://${RAPIDAPI_HOST}`;
+const DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 99);
 
 // Example path to verify connectivity (replace with your sealed-products endpoint later)
 // For now mirrors your snippet endpoint
@@ -38,6 +39,30 @@ function setCache(key, data, ttlMs = 1000 * 60 * 60) { // 1h default
   cache.set(key, { ts: Date.now(), ttlMs, data });
 }
 
+// Simple UTC daily quota (resets at 00:00 UTC)
+let quotaState = { day: new Date().toISOString().slice(0, 10), used: 0 };
+function nowDayUTC() { return new Date().toISOString().slice(0, 10); }
+function resetQuotaIfNeeded() {
+  const today = nowDayUTC();
+  if (quotaState.day !== today) quotaState = { day: today, used: 0 };
+}
+function checkAndUseQuota() {
+  resetQuotaIfNeeded();
+  if (quotaState.used >= DAILY_LIMIT) return { allowed: false, remaining: 0, resetDay: quotaState.day };
+  quotaState.used += 1;
+  return { allowed: true, remaining: DAILY_LIMIT - quotaState.used, resetDay: quotaState.day };
+}
+function quotaExceeded(res) {
+  resetQuotaIfNeeded();
+  return res.status(429).json({
+    error: 'Daily API quota reached',
+    limit: DAILY_LIMIT,
+    used: quotaState.used,
+    remaining: Math.max(0, DAILY_LIMIT - quotaState.used),
+    resetUtcDay: nowDayUTC()
+  });
+}
+
 // Proxy for episodes (connectivity check)
 app.get('/api/episodes', async (req, res) => {
   try {
@@ -47,6 +72,9 @@ app.get('/api/episodes', async (req, res) => {
 
     const cached = getCache(url);
     if (cached) return res.json(cached);
+
+    const quota = checkAndUseQuota();
+    if (!quota.allowed) return quotaExceeded(res);
 
     const resp = await fetch(url, {
       method: 'GET',
@@ -79,6 +107,8 @@ app.get('/api/products', async (req, res) => {
     const url = `${API_BASE}${PRODUCTS_PATH}?${params.toString()}`;
     const cached = getCache(url);
     if (cached) return res.json(cached);
+    const quota = checkAndUseQuota();
+    if (!quota.allowed) return quotaExceeded(res);
     const resp = await fetch(url, { headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST } });
     const json = await resp.json();
     setCache(url, json, 1000 * 60 * 60);
@@ -101,6 +131,8 @@ app.get('/api/products/search', async (req, res) => {
     const url = `${API_BASE}${PRODUCTS_SEARCH_PATH}?${params.toString()}`;
     const cached = getCache(url);
     if (cached) return res.json(cached);
+    const quota = checkAndUseQuota();
+    if (!quota.allowed) return quotaExceeded(res);
     const resp = await fetch(url, { headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST } });
     const json = await resp.json();
     setCache(url, json, 1000 * 60 * 60);
@@ -118,6 +150,8 @@ app.get('/api/products/:id', async (req, res) => {
     const url = `${API_BASE}${PRODUCTS_PATH}/${encodeURIComponent(id)}`;
     const cached = getCache(url);
     if (cached) return res.json(cached);
+    const quota = checkAndUseQuota();
+    if (!quota.allowed) return quotaExceeded(res);
     const resp = await fetch(url, { headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST } });
     const json = await resp.json();
     setCache(url, json, 1000 * 60 * 60);
